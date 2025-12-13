@@ -14,10 +14,8 @@ from tools import (
     analyze_meal_image,
     warm_up_rag,
     get_food_nutrition,
+    evaluate_meal_healthiness,
 )
-
-
-
 
 load_dotenv()
 
@@ -33,7 +31,7 @@ def _build_tools_spec() -> List[Dict[str, Any]]:
     """
     Build the function-calling tool specifications for Mistral.
     """
-    tools = [
+    tools: List[Dict[str, Any]] = [
         {
             "type": "function",
             "function": {
@@ -53,7 +51,8 @@ def _build_tools_spec() -> List[Dict[str, Any]]:
                             "description": (
                                 "JSON string with keys 'meal_label' (string: breakfast/lunch/dinner/snack) "
                                 "and 'items' (array of objects with 'name' and 'mass_g'). "
-                                "Example: '{\"meal_label\": \"lunch\", \"items\": ["
+                                "Example: "
+                                "'{\"meal_label\": \"lunch\", \"items\": ["
                                 "{\"name\": \"pork sausage\", \"mass_g\": 120}, "
                                 "{\"name\": \"potatoes\", \"mass_g\": 150}]}'"
                             ),
@@ -68,8 +67,10 @@ def _build_tools_spec() -> List[Dict[str, Any]]:
             "function": {
                 "name": "get_food_nutrition",
                 "description": (
-                    "Fetch basic nutrition information for a single food from the USDA FoodData Central API. "
-                    "Use this when the user asks about calories or nutrients of a specific food they ate."
+                    "Retrieve basic nutrition information for a single food item "
+                    "using the USDA FoodData Central API. "
+                    "The result is per 100 g and includes energy (kcal), protein, fat, "
+                    "carbohydrates, sugars, fiber and sodium when available."
                 ),
                 "parameters": {
                     "type": "object",
@@ -77,8 +78,9 @@ def _build_tools_spec() -> List[Dict[str, Any]]:
                         "food_name": {
                             "type": "string",
                             "description": (
-                                "Short generic name of a food item, such as "
-                                "'cow milk', 'boiled potatoes', 'pork sausage', 'apple'."
+                                "Short English name of the food, for example "
+                                "'cow milk', 'orange', 'banana', 'spaghetti', "
+                                "'pork sausage', 'plain croissant'."
                             ),
                         }
                     },
@@ -86,28 +88,61 @@ def _build_tools_spec() -> List[Dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "evaluate_meal_healthiness",
+                "description": (
+                    "Classify a SINGLE MEAL as healthy or unhealthy using a small ML model "
+                    "trained on a healthy eating dataset. "
+                    "Input must contain the total nutrition values for that meal only "
+                    "(not the whole day), and the tool returns a prediction plus an "
+                    "analysis of strengths and weaknesses (for example low fiber, high sugar, etc.)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "string",
+                            "description": (
+                                "JSON string with keys 'meal_label' and numeric totals for that meal: "
+                                "calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, sodium_mg. "
+                                "Example: "
+                                "'{\"meal_label\": \"dinner\", \"calories\": 750, \"protein_g\": 30, "
+                                "\"carbs_g\": 60, \"fat_g\": 28, \"fiber_g\": 7, "
+                                "\"sugar_g\": 8, \"sodium_mg\": 900}'"
+                            ),
+                        }
+                    },
+                    "required": ["payload"],
+                },
+            },
+        },
     ]
     return tools
 
 
-
-
 @dataclass
 class CarbonAgent:
-    model: str = "mistral-small-latest"
+    model: str = field(default_factory=lambda: os.getenv("MISTRAL_MODEL", "mistral-small-latest"))
+    temperature: float = field(default_factory=lambda: float(os.getenv("MISTRAL_TEMPERATURE", "0.2")))
     client: Mistral = field(default_factory=_get_mistral_client)
     tools_spec: List[Dict[str, Any]] = field(default_factory=_build_tools_spec)
     messages: List[Any] = field(default_factory=list)
     display_history: List[Dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # System prompt
         self.messages.append({"role": "system", "content": SYSTEM_PROMPT})
-        
-        self.names_to_functions = {
+
+        # Map tool names -> Python functions
+        self.names_to_functions: Dict[str, Any] = {
             "compute_meal_footprint": compute_meal_footprint,
             "get_food_nutrition": get_food_nutrition,
+            "evaluate_meal_healthiness": evaluate_meal_healthiness,
         }
-        
+
+        # Warm up RAG (build or load vectorstore)
         warm_up_rag()
 
     def get_display_history(self) -> List[Dict[str, str]]:
@@ -117,79 +152,108 @@ class CarbonAgent:
         return analyze_meal_image(image_bytes=image_bytes)
 
     def _run_one_step_with_tools(self) -> str:
-        # First call with tools
-        response = self.client.chat.complete(
-            model=self.model,
-            messages=self.messages,
-            tools=self.tools_spec,
-            tool_choice="auto",
-        )
+        """
+        Run one logical assistant step, allowing the model to:
+        - call one or several tools,
+        - get their results,
+        - and finally produce a normal assistant message.
 
-        assistant_message = response.choices[0].message
-        tool_calls = getattr(assistant_message, "tool_calls", None)
+        We loop a few times to allow chained tool calls (e.g. CO2 -> nutrition -> ML classifier)
+        in a single user turn, while always keeping the number of tool_calls and tool responses
+        perfectly aligned (so Mistral does not raise 'Not the same number of function calls and responses').
+        """
+        max_tool_loops = 5
 
-        # If no tool calls, return the response directly
-        if not tool_calls:
+        for _ in range(max_tool_loops):
+            response = self.client.chat.complete(
+                model=self.model,
+                messages=self.messages,
+                tools=self.tools_spec,
+                tool_choice="auto",
+                temperature=self.temperature,
+            )
+
+            assistant_message = response.choices[0].message
+            tool_calls = getattr(assistant_message, "tool_calls", None) or []
+
+            # Case 1: no tool calls -> final answer
+            if not tool_calls:
+                self.messages.append(assistant_message)
+                content = assistant_message.content or ""
+                self.display_history.append({"role": "assistant", "content": content})
+                return content
+
+            # Case 2: assistant is asking to call one or more tools
             self.messages.append(assistant_message)
-            content = assistant_message.content or ""
-            self.display_history.append({"role": "assistant", "content": content})
-            return content
 
-        # Process tool calls
-        self.messages.append(assistant_message)
-        
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            raw_args = tool_call.function.arguments
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                raw_args = tool_call.function.arguments
 
-            print(f"[DEBUG] Tool called: {function_name}")
-            print(f"[DEBUG] Raw arguments: {raw_args}")
+                print(f"[DEBUG] Tool called: {function_name}")
+                print(f"[DEBUG] Raw arguments: {raw_args}")
 
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError as e:
-                print(f"[ERROR] Failed to parse tool arguments: {e}")
-                function_result = json.dumps({
-                    "error": "Tool arguments were not valid JSON.",
-                    "raw_arguments": raw_args,
-                })
-            else:
-                fn = self.names_to_functions.get(function_name)
-                if fn is None:
-                    function_result = json.dumps({
-                        "error": f"Unknown tool {function_name}",
-                        "raw_arguments": args,
-                    })
+                # Parse arguments JSON
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError as e:
+                    print(f"[ERROR] Failed to parse tool arguments: {e}")
+                    function_result = json.dumps(
+                        {
+                            "error": "Tool arguments were not valid JSON.",
+                            "raw_arguments": raw_args,
+                        }
+                    )
                 else:
-                    try:
-                        function_result = fn(**args)
-                        print(f"[DEBUG] Tool result: {function_result[:200]}...")
-                    except Exception as exc:
-                        print(f"[ERROR] Tool execution failed: {exc}")
-                        function_result = json.dumps({
-                            "error": f"Exception while running tool {function_name}: {exc}",
-                            "raw_arguments": args,
-                        })
+                    fn = self.names_to_functions.get(function_name)
+                    if fn is None:
+                        function_result = json.dumps(
+                            {
+                                "error": f"Unknown tool {function_name}",
+                                "raw_arguments": args,
+                            }
+                        )
+                    else:
+                        try:
+                            # Normal case: function defined with keyword arguments
+                            function_result = fn(**args)
+                        except TypeError:
+                            # Fallback: some tools may expect a single positional argument
+                            try:
+                                function_result = fn(args)
+                            except Exception as exc:
+                                print(f"[ERROR] Tool execution failed: {exc}")
+                                function_result = json.dumps(
+                                    {
+                                        "error": f"Exception while running tool {function_name}: {exc}",
+                                        "raw_arguments": args,
+                                    }
+                                )
+                        except Exception as exc:
+                            print(f"[ERROR] Tool execution failed: {exc}")
+                            function_result = json.dumps(
+                                {
+                                    "error": f"Exception while running tool {function_name}: {exc}",
+                                    "raw_arguments": args,
+                                }
+                            )
 
-            self.messages.append({
-                "role": "tool",
-                "name": function_name,
-                "content": function_result,
-                "tool_call_id": tool_call.id,
-            })
+                print(f"[DEBUG] Tool result: {str(function_result)[:200]}...")
 
-        # Second call to get the final response after tool execution
-        final_response = self.client.chat.complete(
-            model=self.model,
-            messages=self.messages,
-        )
-        
-        final_message = final_response.choices[0].message
-        self.messages.append(final_message)
+                # IMPORTANT: one tool message per tool_call, with matching tool_call_id
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "name": function_name,
+                        "tool_call_id": tool_call.id,
+                        "content": function_result,
+                    }
+                )
 
-        content = final_message.content or ""
-        self.display_history.append({"role": "assistant", "content": content})
-        return content
+        # If we exit the loop without a final assistant message
+        fallback = "I'm sorry, something went wrong while coordinating tools. Please try rephrasing your last message."
+        self.display_history.append({"role": "assistant", "content": fallback})
+        return fallback
 
     def chat(self, user_message: str) -> str:
         self.messages.append({"role": "user", "content": user_message})
