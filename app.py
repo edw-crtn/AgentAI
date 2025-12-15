@@ -145,6 +145,22 @@ class CarbonAgent:
         # Warm up RAG (build or load vectorstore)
         warm_up_rag()
 
+        # Initial assistant greeting shown in the chat BEFORE any user message
+        intro_message = (
+        "Hi! I am your personal food carbon footprint and nutrition assistant.\n\n"
+        "I will help you estimate the CO2 emissions of your meals, compute basic "
+        "nutrition values (calories, protein, carbs, fat, sugar, fiber, sodium), "
+        "and, if you want, analyze how healthy each meal is using a small ML model.\n\n"
+        "Let's go step by step through your day.\n"
+        "To start, what did you have for breakfast today? Please list the foods "
+        "and, if you can, approximate quantities in grams (for example: "
+        "\"1 orange (130 g), 2 slices of whole wheat bread (60 g), 2 eggs (120 g)\")."
+        )
+
+        # We register this as an assistant message in the conversation history
+        self.messages.append({"role": "assistant", "content": intro_message})
+        self.display_history.append({"role": "assistant", "content": intro_message})
+
     def get_display_history(self) -> List[Dict[str, str]]:
         return self.display_history
 
