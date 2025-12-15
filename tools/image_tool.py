@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from mistralai import Mistral
+from langsmith import traceable 
 
 from prompt import IMAGE_ANALYSIS_PROMPT
 
@@ -22,7 +23,7 @@ def _get_mistral_client() -> Mistral:
         raise EnvironmentError("MISTRAL_API_KEY environment variable is not set.")
     return Mistral(api_key=api_key)
 
-
+@traceable
 def analyze_meal_image(image_bytes: bytes) -> List[Dict[str, Any]]:
     """
     Analyze a meal image using a vision-capable Mistral model (for example pixtral-12b-2409).

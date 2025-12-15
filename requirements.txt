@@ -18,3 +18,5 @@ requests
 scikit-learn
 joblib
 numpy
+langsmith
+

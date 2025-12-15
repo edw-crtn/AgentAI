@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from mistralai import Mistral
+from langsmith import traceable
+
 
 from prompt import SYSTEM_PROMPT
 from tools import (
@@ -161,6 +163,15 @@ class CarbonAgent:
         self.messages.append({"role": "assistant", "content": intro_message})
         self.display_history.append({"role": "assistant", "content": intro_message})
 
+    @traceable  # This will create a LangSmith trace for every call
+    def _mistral_chat(self, **kwargs):
+        """
+        Small wrapper around Mistral chat.complete so that
+        all LLM calls are automatically traced in LangSmith.
+        kwargs must contain at least: model, messages, and optionally tools, tool_choice, etc.
+        """
+        return self.client.chat.complete(**kwargs)
+    
     def get_display_history(self) -> List[Dict[str, str]]:
         return self.display_history
 
@@ -181,7 +192,7 @@ class CarbonAgent:
         max_tool_loops = 5
 
         for _ in range(max_tool_loops):
-            response = self.client.chat.complete(
+            response = self._mistral_chat(
                 model=self.model,
                 messages=self.messages,
                 tools=self.tools_spec,
