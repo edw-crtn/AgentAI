@@ -7,13 +7,12 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from mistralai import Mistral
-from langsmith import traceable
 
 
 from prompt import SYSTEM_PROMPT
 from tools import (
     compute_meal_footprint,
-    analyze_meal_image,
+    analyze_meal_image_with_usage,
     warm_up_rag,
     get_food_nutrition,
     evaluate_meal_healthiness,
@@ -21,6 +20,93 @@ from tools import (
 
 load_dotenv()
 
+
+
+class TokenTracker:
+    """Accumulates token usage across all model calls in a Streamlit session.
+
+    We rely on the `usage` field returned by the Mistral SDK. If usage is missing,
+    we simply do not count tokens for that call.
+    """
+
+    def __init__(self) -> None:
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.calls = 0
+        self.vision_calls = 0
+        self.vision_total_tokens = 0
+
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> Dict[str, int]:
+        if usage is None:
+            return {}
+        if isinstance(usage, dict):
+            return {k: int(v) for k, v in usage.items() if isinstance(v, (int, float))}
+        # SDK objects sometimes expose attributes
+        out: Dict[str, int] = {}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            if hasattr(usage, key):
+                val = getattr(usage, key)
+                if isinstance(val, (int, float)):
+                    out[key] = int(val)
+        return out
+
+    def add_from_mistral_response(self, resp: Any, *, is_vision: bool = False) -> None:
+        usage = getattr(resp, "usage", None)
+        usage_dict = self._usage_to_dict(usage)
+
+        # Some SDK responses may nest usage; keep it robust
+        if not usage_dict and isinstance(resp, dict):
+            usage_dict = self._usage_to_dict(resp.get("usage"))
+
+        if not usage_dict:
+            return
+
+        p = int(usage_dict.get("prompt_tokens", 0))
+        c = int(usage_dict.get("completion_tokens", 0))
+        t = int(usage_dict.get("total_tokens", 0)) or (p + c)
+
+        self.prompt_tokens += p
+        self.completion_tokens += c
+        self.total_tokens += t
+        self.calls += 1
+
+        if is_vision:
+            self.vision_calls += 1
+            self.vision_total_tokens += t
+
+    def summary(self) -> Dict[str, int]:
+        return {
+            "calls": self.calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "vision_calls": self.vision_calls,
+            "vision_total_tokens": self.vision_total_tokens,
+        }
+
+
+def _tokens_to_co2_and_km(total_tokens: int) -> Dict[str, float]:
+    """Convert tokens into a CO2 estimate and an equivalent car distance.
+
+    The conversion factors are configurable via env vars so you can justify them in your report.
+    Defaults are intentionally conservative and should be cited/justified in the report.
+    """
+    token_co2_g_per_1k = float(os.getenv("TOKEN_CO2_G_PER_1K", "0.4"))  # grams CO2 per 1K tokens
+    car_co2_g_per_km = float(os.getenv("CAR_CO2_G_PER_KM", "120"))      # grams CO2 per km
+
+    co2_g = (total_tokens / 1000.0) * token_co2_g_per_1k
+    co2_kg = co2_g / 1000.0
+    km = co2_g / car_co2_g_per_km if car_co2_g_per_km > 0 else 0.0
+
+    return {
+        "token_co2_g_per_1k": token_co2_g_per_1k,
+        "car_co2_g_per_km": car_co2_g_per_km,
+        "co2_g": co2_g,
+        "co2_kg": co2_kg,
+        "km": km,
+    }
 
 def _get_mistral_client() -> Mistral:
     api_key = os.getenv("MISTRAL_API_KEY")
@@ -132,6 +218,9 @@ class CarbonAgent:
     tools_spec: List[Dict[str, Any]] = field(default_factory=_build_tools_spec)
     messages: List[Any] = field(default_factory=list)
     display_history: List[Dict[str, str]] = field(default_factory=list)
+    token_tracker: TokenTracker = field(default_factory=TokenTracker)
+    _health_analysis_called: bool = False
+    _token_report_sent: bool = False
 
     def __post_init__(self) -> None:
         # System prompt
@@ -162,21 +251,39 @@ class CarbonAgent:
         # We register this as an assistant message in the conversation history
         self.messages.append({"role": "assistant", "content": intro_message})
         self.display_history.append({"role": "assistant", "content": intro_message})
-
-    @traceable  # This will create a LangSmith trace for every call
     def _mistral_chat(self, **kwargs):
-        """
-        Small wrapper around Mistral chat.complete so that
-        all LLM calls are automatically traced in LangSmith.
-        kwargs must contain at least: model, messages, and optionally tools, tool_choice, etc.
-        """
-        return self.client.chat.complete(**kwargs)
+        """Wrapper around `client.chat.complete` that also accumulates token usage."""
+        resp = self.client.chat.complete(**kwargs)
+        self.token_tracker.add_from_mistral_response(resp, is_vision=False)
+        return resp
     
     def get_display_history(self) -> List[Dict[str, str]]:
         return self.display_history
 
     def analyze_image(self, image_bytes: bytes) -> List[Dict[str, Any]]:
-        return analyze_meal_image(image_bytes=image_bytes)
+        items, resp = analyze_meal_image_with_usage(image_bytes=image_bytes)
+        # Track vision token usage if available
+        self.token_tracker.add_from_mistral_response(resp, is_vision=True)
+        return items
+
+
+    def _render_token_report(self) -> str:
+        stats = self.token_tracker.summary()
+        conv = _tokens_to_co2_and_km(stats["total_tokens"])
+
+        # Keep it short and explicit that this is an estimate.
+        lines = []
+        lines.append("### Token and CO₂ estimate for this conversation")
+        lines.append(f"- Total tokens: **{stats['total_tokens']}** (prompt: {stats['prompt_tokens']}, completion: {stats['completion_tokens']})")
+        if stats["vision_calls"] > 0:
+            lines.append(f"- Vision tokens (included above): {stats['vision_total_tokens']} across {stats['vision_calls']} vision call(s)")
+        lines.append(f"- Estimated CO₂ from tokens: **{conv['co2_g']:.2f} g CO₂e** ({conv['co2_kg']:.6f} kg)")
+        lines.append(f"- Car-equivalent distance: **{conv['km']:.3f} km** (using {conv['car_co2_g_per_km']:.0f} g CO₂/km)")
+        lines.append("")
+        lines.append("_Note: This token→CO₂ conversion uses configurable factors. "
+                     "You can adjust TOKEN_CO2_G_PER_1K and CAR_CO2_G_PER_KM in your .env to match your report assumptions._")
+        return "\n".join(lines)
+
 
     def _run_one_step_with_tools(self) -> str:
         """
@@ -207,6 +314,10 @@ class CarbonAgent:
             if not tool_calls:
                 self.messages.append(assistant_message)
                 content = assistant_message.content or ""
+                # After the ML healthiness analysis, append token/CO2 stats once.
+                if self._health_analysis_called and not self._token_report_sent:
+                    content = content + "\n\n" + self._render_token_report()
+                    self._token_report_sent = True
                 self.display_history.append({"role": "assistant", "content": content})
                 return content
 
@@ -215,6 +326,8 @@ class CarbonAgent:
 
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
+                if function_name == "evaluate_meal_healthiness":
+                    self._health_analysis_called = True
                 raw_args = tool_call.function.arguments
 
                 print(f"[DEBUG] Tool called: {function_name}")
