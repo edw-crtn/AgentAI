@@ -280,9 +280,6 @@ DAILY CO2 SUMMARY
   - Sum the meal subtotals and present:
     - CO2 per meal,
     - total daily CO2,
-    - a simple comparison, for example:
-      - "roughly equivalent to driving X km in a small car",
-      - or "roughly equivalent to a Y-minute hot shower".
 
 NUTRITION WITH FOODDATA CENTRAL (get_food_nutrition) – STEP 1 ONLY
 - Once you have:
