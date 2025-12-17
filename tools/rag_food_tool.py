@@ -17,7 +17,7 @@ EXCEL_SHEET = "SEL CF for users"
 ITEM_COL = "Food commodity ITEM"
 CF_COL = "Carbon Footprint kg CO2eq/kg or l of food ITEM"
 EMBEDDING_MODEL_NAME = os.getenv("MISTRAL_EMBEDDING_MODEL", "mistral-embed")
-SIMILARITY_THRESHOLD = 0.60
+SIMILARITY_THRESHOLD = 0.73
 STORE_DIR = "food_embeddings_store"
 
 _vectorstore = None
