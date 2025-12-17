@@ -280,8 +280,6 @@ class CarbonAgent:
         lines.append(f"- Estimated CO₂ from tokens: **{conv['co2_g']:.2f} g CO₂e** ({conv['co2_kg']:.6f} kg)")
         lines.append(f"- Car-equivalent distance: **{conv['km']:.3f} km** (using {conv['car_co2_g_per_km']:.0f} g CO₂/km)")
         lines.append("")
-        lines.append("_Note: This token→CO₂ conversion uses configurable factors. "
-                     "You can adjust TOKEN_CO2_G_PER_1K and CAR_CO2_G_PER_KM in your .env to match your report assumptions._")
         return "\n".join(lines)
 
 

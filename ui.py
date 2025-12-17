@@ -1,7 +1,5 @@
 # ui.py
 
-import io
-
 import streamlit as st
 
 from app import CarbonAgent
@@ -19,6 +17,7 @@ def get_agent() -> CarbonAgent:
             st.session_state["carbon_agent"] = CarbonAgent()
     return st.session_state["carbon_agent"]
 
+
 def main() -> None:
     st.set_page_config(
         page_title="Food CO2 Assistant",
@@ -30,16 +29,18 @@ def main() -> None:
 
     st.markdown(
         """
-        This assistant helps you estimate the CO2 emissions of what you eat during the day.
-        
-        - Describe your meals in natural language, or  
-        - Upload a photo of your meal and let the agent detect the foods and quantities.
+        This assistant helps you estimate the CO₂ emissions and basic nutrition
+        of what you eat during the day.
+
+        - You can describe your meals in natural language (breakfast, lunch, dinner, snacks).
+        - Or you can upload a photo of your meal: the assistant will detect foods and quantities,
+          then ask you to confirm or correct them directly in the chat.
         """
     )
 
     agent = get_agent()
 
-    # Sidebar for image upload
+    # Sidebar: image upload + analysis
     with st.sidebar:
         st.header("Meal photo")
         uploaded_file = st.file_uploader(
@@ -53,22 +54,50 @@ def main() -> None:
             if st.button("Analyze picture"):
                 with st.spinner("Analyzing image..."):
                     items = agent.analyze_image(image_bytes=image_bytes)
+
                 if not items:
                     st.warning(
                         "The vision model did not return a valid list of foods. "
                         "You can still describe your meal manually in the chat."
                     )
                 else:
-                    # Save last detected items in session, for quick reuse
+                    # Save last detected items in session state (optional)
                     st.session_state["last_detected_items"] = items
+
+                    # Build a human-readable summary
                     readable = ", ".join(
                         f"{round(it['mass_g'])} g {it['name']}" for it in items
                     )
-                    st.success(f"Detected: {readable}")
+                    bullet_lines = "\n".join(
+                        f"- {round(it['mass_g'])} g {it['name']}" for it in items
+                    )
 
-                    st.info(
-                        "You can now paste this into the chat or adapt it:\n\n"
-                        f"\"I ate: {readable}.\""
+                    # 1) Inject a "user" message describing what was detected
+                    user_text = (
+                        "From the photo, this is what the assistant detected for my meal: "
+                        f"{readable}."
+                    )
+                    agent.messages.append({"role": "user", "content": user_text})
+                    agent.display_history.append({"role": "user", "content": user_text})
+
+                    # 2) Inject an "assistant" message asking for confirmation/correction
+                    assistant_text = (
+                        "I analyzed your meal picture and detected the following items:\n\n"
+                        f"{bullet_lines}\n\n"
+                        "Please confirm if this is correct, or send a message to adjust the foods "
+                        "and quantities (for example: \"replace 150 g spaghetti with 200 g\" or "
+                        "\"add 1 glass of orange juice (200 ml)\")."
+                    )
+                    agent.messages.append(
+                        {"role": "assistant", "content": assistant_text}
+                    )
+                    agent.display_history.append(
+                        {"role": "assistant", "content": assistant_text}
+                    )
+
+                    st.success(
+                        "The detected meal description has been inserted into the chat. "
+                        "Please confirm or correct it in the conversation."
                     )
 
     # Chat history
@@ -80,7 +109,7 @@ def main() -> None:
             with st.chat_message("assistant"):
                 st.markdown(msg["content"])
 
-    # User input
+    # User text input
     user_input = st.chat_input("Describe what you ate for a meal…")
     if user_input:
         with st.chat_message("user"):
